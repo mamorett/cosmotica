@@ -84,6 +84,29 @@ def get_status():
         "sys_info": sys_info
     }
 
+import json
+import queue
+import threading
+
+def run_generation_in_thread(func, *args, **kwargs):
+    """Run a generation function in a background thread and queue progress/result events."""
+    q = queue.Queue()
+    
+    def progress_callback(value, message):
+        q.put({"type": "progress", "value": value, "message": message})
+        
+    def worker():
+        try:
+            kwargs["progress_callback"] = progress_callback
+            result = func(*args, **kwargs)
+            q.put({"type": "finished", "result": result})
+        except Exception as e:
+            q.put({"type": "error", "error": str(e)})
+            
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return q
+
 @app.post("/generate/t2i")
 def generate_t2i(
     prompt: str = Form(...),
@@ -94,35 +117,46 @@ def generate_t2i(
     guidance: float = Form(7.0),
     seed: int = Form(-1)
 ):
-    """Generate image from text prompt and return raw JPEG bytes."""
+    """Generate image from text prompt and stream JSON lines of progress and result."""
     if not engine:
         raise HTTPException(status_code=503, detail="Inference engine not ready")
         
     actual_seed = None if seed == -1 else seed
     logger.info(f"T2I Request - Prompt: '{prompt}', Size: {width}x{height}, Steps: {steps}, Seed: {actual_seed}")
     
-    try:
-        # Run generation
-        image = engine.generate_image(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            steps=steps,
-            guidance=guidance,
-            seed=actual_seed
-        )
-        
-        # Save to buffer
-        img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format='JPEG', quality=95)
-        img_byte_arr.seek(0)
-        
-        return StreamingResponse(img_byte_arr, media_type="image/jpeg")
-        
-    except Exception as e:
-        logger.error(f"T2I generation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+    q = run_generation_in_thread(
+        engine.generate_image,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        width=width,
+        height=height,
+        steps=steps,
+        guidance=guidance,
+        seed=actual_seed
+    )
+    
+    def event_stream():
+        import base64
+        while True:
+            try:
+                event = q.get(timeout=1.0)
+                if event["type"] == "progress":
+                    yield json.dumps(event) + "\n"
+                elif event["type"] == "error":
+                    yield json.dumps({"type": "error", "message": event["error"]}) + "\n"
+                    break
+                elif event["type"] == "finished":
+                    image = event["result"]
+                    img_byte_arr = io.BytesIO()
+                    image.save(img_byte_arr, format='JPEG', quality=95)
+                    base64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+                    yield json.dumps({"type": "finished", "data": base64_data}) + "\n"
+                    break
+            except queue.Empty:
+                # Send a ping to keep connection active
+                yield json.dumps({"type": "ping"}) + "\n"
+                
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 @app.post("/generate/i2v")
 async def generate_i2v(
@@ -137,7 +171,7 @@ async def generate_i2v(
     guidance: float = Form(7.0),
     seed: int = Form(-1)
 ):
-    """Generate video from reference image and return raw MP4 video bytes."""
+    """Generate video from reference image and stream JSON lines of progress and result."""
     if not engine:
         raise HTTPException(status_code=503, detail="Inference engine not ready")
         
@@ -152,45 +186,60 @@ async def generate_i2v(
         logger.error(f"Failed to read input image: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid reference image: {str(e)}")
         
-    temp_mp4_path = None
-    try:
-        # Run video generation
-        frames, actual_fps = engine.generate_video(
-            image=pil_image,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            fps=fps,
-            steps=steps,
-            guidance=guidance,
-            seed=actual_seed
-        )
-        
-        # Save video to a temporary MP4 file
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_mp4:
-            temp_mp4_path = temp_mp4.name
-            
-        engine.save_output(frames, temp_mp4_path, actual_fps)
-        
-        # Read file bytes to return
-        with open(temp_mp4_path, 'rb') as f:
-            video_bytes = f.read()
-            
-        return StreamingResponse(io.BytesIO(video_bytes), media_type="video/mp4")
-        
-    except Exception as e:
-        logger.error(f"I2V generation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
-        
-    finally:
-        # Always clean up server temp files
-        if temp_mp4_path and os.path.exists(temp_mp4_path):
-            try:
-                os.unlink(temp_mp4_path)
-            except Exception as ex:
-                logger.warning(f"Could not delete temp file {temp_mp4_path}: {ex}")
+    q = run_generation_in_thread(
+        engine.generate_video,
+        image=pil_image,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        fps=fps,
+        steps=steps,
+        guidance=guidance,
+        seed=actual_seed
+    )
+    
+    def event_stream():
+        import base64
+        temp_mp4_path = None
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=1.0)
+                    if event["type"] == "progress":
+                        yield json.dumps(event) + "\n"
+                    elif event["type"] == "error":
+                        yield json.dumps({"type": "error", "message": event["error"]}) + "\n"
+                        break
+                    elif event["type"] == "finished":
+                        frames, actual_fps = event["result"]
+                        
+                        # Save video to a temporary MP4 file
+                        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_mp4:
+                            temp_mp4_path = temp_mp4.name
+                            
+                        engine.save_output(frames, temp_mp4_path, actual_fps)
+                        
+                        # Read file bytes and encode to base64
+                        with open(temp_mp4_path, 'rb') as f:
+                            video_bytes = f.read()
+                            
+                        base64_data = base64.b64encode(video_bytes).decode('utf-8')
+                        yield json.dumps({"type": "finished", "data": base64_data}) + "\n"
+                        break
+                except queue.Empty:
+                    # Send a ping to keep connection active
+                    yield json.dumps({"type": "ping"}) + "\n"
+        finally:
+            # Always clean up server temp files
+            if temp_mp4_path and os.path.exists(temp_mp4_path):
+                try:
+                    os.unlink(temp_mp4_path)
+                except Exception as ex:
+                    logger.warning(f"Could not delete temp file {temp_mp4_path}: {ex}")
+                        
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 def main():
     parser = argparse.ArgumentParser(description="Cosmos3 Remote GPU Server")

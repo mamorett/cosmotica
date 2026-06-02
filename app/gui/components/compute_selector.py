@@ -59,6 +59,7 @@ class ComputeSelector(QWidget):
         self.url_input = QLineEdit(self.default_url)
         self.url_input.setPlaceholderText("http://<ip-or-host>:<port>")
         self.url_input.textChanged.connect(self._on_url_changed)
+        self.url_input.returnPressed.connect(self._test_connection)
         url_layout.addWidget(self.url_input)
         
         self.test_btn = QPushButton("🔌 Test Connection")
@@ -84,7 +85,11 @@ class ComputeSelector(QWidget):
         self._notify_change()
         
     def _on_url_changed(self, text):
-        self._notify_change()
+        if self.engine:
+            self.engine.remote_url = text.strip()
+        self.status_label.setText("Status: URL changed (click 'Test Connection' to verify)")
+        self.status_label.setStyleSheet("color: #ffaa00; font-style: italic;")
+
         
     def _update_visibility(self):
         is_remote = self.get_target() == "remote"

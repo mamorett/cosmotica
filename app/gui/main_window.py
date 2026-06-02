@@ -26,6 +26,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.app_config = AppConfig()
+        self._load_settings()
         self.engine = InferenceEngine()
         self.generated_data = None
         self.generated_type = None
@@ -33,6 +34,37 @@ class MainWindow(QMainWindow):
         
         self.init_ui()
         self.init_engine()
+        
+    def _load_settings(self):
+        """Load user settings from cache directory."""
+        settings_file = self.app_config.CACHE_DIR / "settings.json"
+        if settings_file.exists():
+            try:
+                import json
+                with open(settings_file, "r") as f:
+                    data = json.load(f)
+                    if "inference_target" in data:
+                        self.app_config.DEFAULT_INFERENCE_TARGET = data["inference_target"]
+                    if "remote_url" in data:
+                        self.app_config.DEFAULT_REMOTE_URL = data["remote_url"]
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Could not load settings: {e}")
+
+    def _save_settings(self, target, url):
+        """Save current user settings to cache directory."""
+        try:
+            import json
+            self.app_config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            settings_file = self.app_config.CACHE_DIR / "settings.json"
+            with open(settings_file, "w") as f:
+                json.dump({
+                    "inference_target": target,
+                    "remote_url": url
+                }, f, indent=2)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Could not save settings: {e}")
     
     def init_ui(self):
         """Initialize the user interface."""
@@ -206,8 +238,9 @@ class MainWindow(QMainWindow):
         # Clean current output/states on target switch
         self.media_preview.clear()
         
-        # Trigger re-initialization of engine
-        self.init_engine()
+        # Update settings on engine without running blocking initialization
+        self.engine.set_inference_target(target, url)
+        self.status_bar.showMessage(f"Compute target switched to: {target.upper()}")
         
     def _on_mode_changed(self, mode: str):
         """Handle generation mode change."""
@@ -400,6 +433,11 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
+            # Save settings on confirmation exit
+            self._save_settings(
+                self.compute_selector.get_target(),
+                self.compute_selector.get_url()
+            )
             self.engine.shutdown()
             event.accept()
         else:

@@ -105,9 +105,6 @@ class InferenceEngine:
         """
         Generate image from text prompt (locally or remotely).
         """
-        if self.mock_mode:
-            return self._generate_mock_image(prompt, width, height, progress_callback)
-            
         if self.inference_target == "remote":
             return self._generate_remote_image(
                 prompt=prompt,
@@ -120,9 +117,16 @@ class InferenceEngine:
                 progress_callback=progress_callback
             )
             
+        if self.mock_mode:
+            return self._generate_mock_image(prompt, width, height, progress_callback)
+            
         # Local Mode
         if not self.generation_pipeline:
-            raise RuntimeError("Engine not initialized. Call initialize() first.")
+            self.initialize(progress_callback)
+            if self.mock_mode:
+                return self._generate_mock_image(prompt, width, height, progress_callback)
+            if not self.generation_pipeline:
+                raise RuntimeError("Failed to initialize local inference engine.")
         
         if progress_callback:
             progress_callback(0, "Starting image generation...")
@@ -135,6 +139,7 @@ class InferenceEngine:
             num_inference_steps=steps,
             guidance_scale=guidance,
             seed=seed,
+            progress_callback=progress_callback
         )
         
         if progress_callback:
@@ -159,12 +164,6 @@ class InferenceEngine:
         """
         Generate video from image and text prompt (locally or remotely).
         """
-        if self.mock_mode:
-            # If image is path, load it
-            if isinstance(image, str):
-                image = Image.open(image)
-            return self._generate_mock_video(image, prompt, width, height, num_frames, fps, progress_callback)
-            
         if self.inference_target == "remote":
             return self._generate_remote_video(
                 image=image,
@@ -180,9 +179,21 @@ class InferenceEngine:
                 progress_callback=progress_callback
             )
             
+        if self.mock_mode:
+            # If image is path, load it
+            if isinstance(image, str):
+                image = Image.open(image)
+            return self._generate_mock_video(image, prompt, width, height, num_frames, fps, progress_callback)
+            
         # Local Mode
         if not self.generation_pipeline:
-            raise RuntimeError("Engine not initialized. Call initialize() first.")
+            self.initialize(progress_callback)
+            if self.mock_mode:
+                if isinstance(image, str):
+                    image = Image.open(image)
+                return self._generate_mock_video(image, prompt, width, height, num_frames, fps, progress_callback)
+            if not self.generation_pipeline:
+                raise RuntimeError("Failed to initialize local inference engine.")
         
         if progress_callback:
             progress_callback(0, "Starting video generation...")
@@ -198,6 +209,7 @@ class InferenceEngine:
             num_inference_steps=steps,
             guidance_scale=guidance,
             seed=seed,
+            progress_callback=progress_callback
         )
         
         if progress_callback:
@@ -216,9 +228,9 @@ class InferenceEngine:
         seed: Optional[int],
         progress_callback: Callable = None,
     ) -> Image.Image:
-        """Helper to send text-to-image request to remote server."""
+        """Helper to send text-to-image request to remote server with streaming progress updates."""
         if progress_callback:
-            progress_callback(20, "Sending request to remote GPU server...")
+            progress_callback(5, "Connecting to remote GPU server...")
             
         data = {
             "prompt": prompt,
@@ -234,26 +246,43 @@ class InferenceEngine:
             response = requests.post(
                 f"{self.remote_url}/generate/t2i",
                 data=data,
-                timeout=120  # Remote generation can take a bit
+                stream=True,
+                timeout=600  # Generous 10-minute timeout to allow cold start model loading
             )
             
             if response.status_code != 200:
-                error_msg = f"Remote server error: {response.text}"
-                try:
-                    error_msg = response.json().get("detail", error_msg)
-                except:
-                    pass
-                raise RuntimeError(error_msg)
+                raise RuntimeError(f"Remote server returned status code {response.status_code}")
                 
-            if progress_callback:
-                progress_callback(80, "Receiving image from server...")
-                
-            image = Image.open(io.BytesIO(response.content))
+            content_type = response.headers.get("Content-Type", "").lower()
             
-            if progress_callback:
-                progress_callback(100, "Generation complete!")
-                
-            return image
+            # STREAMING PROTOCOL: If server returns NDJSON, parse it line-by-line
+            if "ndjson" in content_type:
+                import json
+                import base64
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    event = json.loads(line.decode('utf-8'))
+                    if event["type"] == "progress":
+                        if progress_callback:
+                            progress_callback(event["value"], event["message"])
+                    elif event["type"] == "error":
+                        raise RuntimeError(event["message"])
+                    elif event["type"] == "finished":
+                        file_bytes = base64.b64decode(event["data"])
+                        image = Image.open(io.BytesIO(file_bytes))
+                        if progress_callback:
+                            progress_callback(100, "Generation complete!")
+                        return image
+                raise RuntimeError("Event stream ended without producing result.")
+            else:
+                # RAW JPEG PROTOCOL: Read response content directly without byte corruption
+                if progress_callback:
+                    progress_callback(50, "Downloading image from remote server...")
+                image = Image.open(io.BytesIO(response.content))
+                if progress_callback:
+                    progress_callback(100, "Generation complete!")
+                return image
             
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to communicate with remote server: {e}")
@@ -272,9 +301,9 @@ class InferenceEngine:
         seed: Optional[int],
         progress_callback: Callable = None,
     ) -> Tuple[List[Image.Image], float]:
-        """Helper to send image-to-video request to remote server."""
+        """Helper to send image-to-video request to remote server with streaming progress updates."""
         if progress_callback:
-            progress_callback(20, "Preparing reference image...")
+            progress_callback(5, "Connecting to remote GPU server...")
             
         # Get PIL Image
         if isinstance(image, str):
@@ -301,51 +330,89 @@ class InferenceEngine:
             "image": ("reference.jpg", img_byte_arr, "image/jpeg")
         }
         
-        if progress_callback:
-            progress_callback(40, "Sending video generation request to remote GPU...")
-            
         try:
             response = requests.post(
                 f"{self.remote_url}/generate/i2v",
                 data=data,
                 files=files,
-                timeout=300  # Video generation takes longer
+                stream=True,
+                timeout=1800  # Generous 30-minute timeout for heavy video generation tasks
             )
             
             if response.status_code != 200:
-                error_msg = f"Remote server error: {response.text}"
-                try:
-                    error_msg = response.json().get("detail", error_msg)
-                except:
-                    pass
-                raise RuntimeError(error_msg)
+                raise RuntimeError(f"Remote server returned status code {response.status_code}")
                 
-            if progress_callback:
-                progress_callback(80, "Decoding video frames...")
-                
-            # Write video response content to temporary file
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_video:
-                temp_video.write(response.content)
-                temp_video_path = temp_video.name
-                
-            # Read frames using imageio
+            content_type = response.headers.get("Content-Type", "").lower()
+            import json
+            import base64
             import imageio
-            reader = imageio.get_reader(temp_video_path)
-            frames = []
-            for frame_arr in reader:
-                frames.append(Image.fromarray(frame_arr))
-            reader.close()
             
-            # Clean up temp file
-            try:
-                os.unlink(temp_video_path)
-            except:
-                pass
-                
-            if progress_callback:
-                progress_callback(100, "Video generation complete!")
-                
-            return frames, fps
+            # STREAMING PROTOCOL: If server returns NDJSON, parse it line-by-line
+            if "ndjson" in content_type:
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    event = json.loads(line.decode('utf-8'))
+                    if event["type"] == "progress":
+                        if progress_callback:
+                            progress_callback(event["value"], event["message"])
+                    elif event["type"] == "error":
+                        raise RuntimeError(event["message"])
+                    elif event["type"] == "finished":
+                        file_bytes = base64.b64decode(event["data"])
+                        
+                        if progress_callback:
+                            progress_callback(95, "Decoding video frames...")
+                            
+                        # Write video response content to temporary file
+                        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_video:
+                            temp_video.write(file_bytes)
+                            temp_video_path = temp_video.name
+                            
+                        try:
+                            reader = imageio.get_reader(temp_video_path)
+                            frames = []
+                            for frame_arr in reader:
+                                frames.append(Image.fromarray(frame_arr))
+                            reader.close()
+                        finally:
+                            # Clean up temp file
+                            try:
+                                os.unlink(temp_video_path)
+                            except:
+                                pass
+                                
+                        if progress_callback:
+                            progress_callback(100, "Video generation complete!")
+                            
+                        return frames, fps
+                raise RuntimeError("Event stream ended without producing result.")
+            else:
+                # RAW VIDEO PROTOCOL: Read response content directly without byte corruption (old server)
+                if progress_callback:
+                    progress_callback(50, "Downloading video from remote server...")
+                video_bytes = response.content
+                if progress_callback:
+                    progress_callback(95, "Decoding video frames...")
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_video:
+                    temp_video.write(video_bytes)
+                    temp_video_path = temp_video.name
+                try:
+                    reader = imageio.get_reader(temp_video_path)
+                    frames = []
+                    for frame_arr in reader:
+                        frames.append(Image.fromarray(frame_arr))
+                    reader.close()
+                finally:
+                    try:
+                        os.unlink(temp_video_path)
+                    except:
+                        pass
+                if progress_callback:
+                    progress_callback(100, "Video generation complete!")
+                return frames, fps
+                    
+            raise RuntimeError("Event stream ended without producing result.")
             
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to communicate with remote server: {e}")

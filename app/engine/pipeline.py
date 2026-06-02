@@ -23,6 +23,7 @@ class GenerationPipeline:
         num_inference_steps: int = 50,
         guidance_scale: float = 7.0,
         seed: Optional[int] = None,
+        progress_callback: Optional[callable] = None,
     ) -> Image.Image:
         """
         Generate an image from text prompt.
@@ -36,6 +37,27 @@ class GenerationPipeline:
         if seed is not None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             generator = torch.Generator(device=device).manual_seed(seed)
+            
+        # Hook progress callback if supported
+        extra_kwargs = {}
+        if progress_callback:
+            try:
+                import inspect
+                sig = inspect.signature(self.pipeline.__call__)
+                if "callback_on_step_end" in sig.parameters:
+                    def step_end_cb(pipe, step, timestep, callback_kwargs):
+                        percent = int(10 + 80 * (step / num_inference_steps))
+                        progress_callback(percent, f"Step {step}/{num_inference_steps}")
+                        return callback_kwargs
+                    extra_kwargs["callback_on_step_end"] = step_end_cb
+                elif "callback" in sig.parameters:
+                    def legacy_cb(step, timestep, latents):
+                        percent = int(10 + 80 * (step / num_inference_steps))
+                        progress_callback(percent, f"Step {step}/{num_inference_steps}")
+                    extra_kwargs["callback"] = legacy_cb
+                    extra_kwargs["callback_steps"] = 1
+            except Exception as e:
+                logger.warning(f"Could not hook T2I pipeline callback: {e}")
         
         # Run inference
         result = self.pipeline(
@@ -47,6 +69,7 @@ class GenerationPipeline:
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             generator=generator,
+            **extra_kwargs
         )
         
         # Extract first frame as image
@@ -85,6 +108,7 @@ class GenerationPipeline:
         num_inference_steps: int = 50,
         guidance_scale: float = 7.0,
         seed: Optional[int] = None,
+        progress_callback: Optional[callable] = None,
     ) -> Tuple[list, float]:
         """
         Generate a video from an input image and text prompt.
@@ -111,6 +135,27 @@ class GenerationPipeline:
         if seed is not None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             generator = torch.Generator(device=device).manual_seed(seed)
+            
+        # Hook progress callback if supported
+        extra_kwargs = {}
+        if progress_callback:
+            try:
+                import inspect
+                sig = inspect.signature(self.pipeline.__call__)
+                if "callback_on_step_end" in sig.parameters:
+                    def step_end_cb(pipe, step, timestep, callback_kwargs):
+                        percent = int(10 + 80 * (step / num_inference_steps))
+                        progress_callback(percent, f"Step {step}/{num_inference_steps}")
+                        return callback_kwargs
+                    extra_kwargs["callback_on_step_end"] = step_end_cb
+                elif "callback" in sig.parameters:
+                    def legacy_cb(step, timestep, latents):
+                        percent = int(10 + 80 * (step / num_inference_steps))
+                        progress_callback(percent, f"Step {step}/{num_inference_steps}")
+                    extra_kwargs["callback"] = legacy_cb
+                    extra_kwargs["callback_steps"] = 1
+            except Exception as e:
+                logger.warning(f"Could not hook I2V pipeline callback: {e}")
         
         # Run inference
         result = self.pipeline(
@@ -124,6 +169,7 @@ class GenerationPipeline:
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             generator=generator,
+            **extra_kwargs
         )
         
         # Extract video frames

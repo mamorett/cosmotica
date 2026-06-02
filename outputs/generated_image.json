@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-06-02T14:08:33.195739",
+  "parameters": {
+    "mode": "t2i",
+    "prompts": {
+      "positive": "an old Terminal with some C code on the amber on black screen. ",
+      "negative": "deformed, distorted, disfigured, poorly drawn, bad anatomy, low quality, pixelated, blurry"
+    },
+    "compute_target": "remote",
+    "server_url": "http://192.168.0.12:9000",
+    "fps": 0.0
+  }
+}
