@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.antigravitycli
+__pycache__
+venv
+.venv
